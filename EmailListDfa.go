@@ -4,28 +4,76 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"strings"
 	"unicode"
 )
 
-// Состояния минимального ДКА. Номер константы совпадает с индексом
+// ─── Состояния ────────────────────────────────────────────────────────────────
+
+// State — состояние минимального ДКА. Номер константы совпадает с индексом
 // состояния q0…q11 в отчёте (q2 = q⊥ — поглощающее состояние отказа).
+type State int
+
 const (
-	qStart         = iota // q0  = {A0, A2}:  ждём первый символ локальной части
-	qLocal                // q1  = {A1}:      читаем локальную часть
-	qDead                 // q⊥  (q2):        поглощающее состояние отказа
-	qAfterAt              // q3  = {A3, A5}:  после @ или «-» в домене ждём \w
-	qDomain               // q4  = {A4}:      читаем часть домена
-	qAfterDot             // q5  = {A6, A10}: после «.» или «-» в домене ждём \w
-	qEmailEnd             // q6  = {A7}:      адрес можно завершить (одна \w после точки)
-	qEmailWord            // q7  = {A8}:      адрес можно завершить, либо \w начала новый адрес
-	qSpaces               // q8  = {A9}:      после адреса прочитаны пробелы
-	qAfterFinalDot        // q9  = {A11, A14}: точка — разделитель домена или списка
-	qAfterSep             // q10 = {A12}:     прочитан разделитель списка [;,.]
-	qAfterHyphen          // q11 = {A13}:     «-» после ≥ 2 символов \w в конце домена
+	qStart         State = iota // q0  = {A0, A2}:   ждём первый символ локальной части
+	qLocal                      // q1  = {A1}:       читаем локальную часть
+	qDead                       // q⊥  (q2):         поглощающее состояние отказа
+	qAfterAt                    // q3  = {A3, A5}:   после @ или «-» в домене ждём \w
+	qDomain                     // q4  = {A4}:       читаем часть домена
+	qAfterDot                   // q5  = {A6, A10}:  после «.» или «-» в домене ждём \w
+	qEmailEnd                   // q6  = {A7}:       адрес можно завершить (одна \w после точки)
+	qEmailWord                  // q7  = {A8}:       адрес можно завершить, либо \w начала новый адрес
+	qSpaces                     // q8  = {A9}:       после адреса прочитаны пробелы
+	qAfterFinalDot              // q9  = {A11, A14}: точка — разделитель домена или списка
+	qAfterSep                   // q10 = {A12}:      прочитан разделитель списка [;,.]
+	qAfterHyphen                // q11 = {A13}:      «-» после ≥ 2 символов \w в конце домена
 )
 
-// stateNames — имена состояний для вывода трассы, как в отчёте.
-var stateNames = [...]string{"q0", "q1", "q⊥", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q10", "q11"}
+// String возвращает имя состояния, как в отчёте.
+func (q State) String() string {
+	return []string{"q0", "q1", "q⊥", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q10", "q11"}[q]
+}
+
+// ─── Входной алфавит ──────────────────────────────────────────────────────────
+
+// Symbol — класс входного символа. Автомат работает не с отдельными
+// рунами, а с классами: все символы одного класса ведут себя одинаково.
+type Symbol int
+
+const (
+	Word   Symbol = iota // \w: буквы, цифры, _ и т. п.
+	Space                // \s: пробельные символы
+	Plus                 // +
+	Hyphen               // -
+	Dot                  // .
+	At                   // @
+	Sep                  // ; или ,
+	Other                // всё остальное — переходов по нему нет нигде
+)
+
+// classify относит руну к классу входного алфавита.
+func classify(r rune) Symbol {
+	switch {
+	case isWord(r):
+		return Word
+	case unicode.IsSpace(r):
+		return Space
+	}
+	switch r {
+	case '+':
+		return Plus
+	case '-':
+		return Hyphen
+	case '.':
+		return Dot
+	case '@':
+		return At
+	case ';', ',':
+		return Sep
+	default:
+		return Other
+	}
+}
 
 // isWord приближённо воспроизводит смысл \w в исходном .NET-паттерне:
 // буквы, десятичные цифры, комбинируемые знаки и знаки соединения (включая _).
@@ -36,181 +84,122 @@ func isWord(r rune) bool {
 		unicode.Is(unicode.Pc, r)
 }
 
-// isSpace соответствует классу \s: пробельные символы.
-func isSpace(r rune) bool {
-	return unicode.IsSpace(r)
+// ─── Автомат ──────────────────────────────────────────────────────────────────
+
+// DFA — распознаватель на основе детерминированного конечного автомата
+// M = (Q, Σ, δ, q0, F). Помимо описания самого M он хранит текущее
+// состояние устройства управления: автомат читает цепочку по одному символу
+// и после каждого такта можно посмотреть, где он находится.
+type DFA struct {
+	start State                      // q0 — начальное состояние
+	dead  State                      // q⊥ — куда ведут отсутствующие в δ переходы
+	final map[State]bool             // F  — заключительные состояния
+	delta map[State]map[Symbol]State // δ  — функция переходов
+
+	current State // текущее состояние
 }
 
-// nextState выполняет один шаг автомата по текущему состоянию и символу.
-// Если для пары «состояние + символ» переход не предусмотрен, уходим в qDead.
-func nextState(state int, r rune) int {
-	w := isWord(r)
-	s := isSpace(r)
+// NewEmailListDFA создаёт распознаватель списков адресов электронной почты:
+//
+//	^((\w+([-+.]\w+)*@\w+([-.]\w+)*\.\w+([-.]\w+)*)\s*[;,.]{0,1}\s*)+$
+//
+// Автомат сразу стоит в начальном состоянии.
+func NewEmailListDFA() *DFA {
+	a := &DFA{
+		start: qStart,
+		dead:  qDead,
+		final: map[State]bool{
+			qEmailEnd:      true,
+			qEmailWord:     true,
+			qSpaces:        true,
+			qAfterFinalDot: true,
+			qAfterSep:      true,
+		},
+		delta: map[State]map[Symbol]State{
+			// Локальная часть: \w+([-+.]\w+)*
+			qStart: {Word: qLocal},
+			qLocal: {Word: qLocal, Plus: qStart, Hyphen: qStart, Dot: qStart, At: qAfterAt},
 
-	switch state {
-	case qStart:
-		if w {
-			return qLocal
-		}
-		return qDead
+			// Домен: \w+([-.]\w+)*\.\w+([-.]\w+)*
+			qAfterAt:     {Word: qDomain},
+			qDomain:      {Word: qDomain, Hyphen: qAfterAt, Dot: qAfterDot},
+			qAfterDot:    {Word: qEmailEnd},
+			qEmailEnd:    {Word: qEmailWord, Space: qSpaces, Hyphen: qAfterDot, Dot: qAfterFinalDot, Sep: qAfterSep},
+			qEmailWord:   {Word: qEmailWord, Space: qSpaces, Plus: qStart, Hyphen: qAfterHyphen, Dot: qAfterFinalDot, At: qAfterAt, Sep: qAfterSep},
+			qAfterHyphen: {Word: qEmailWord},
 
-	case qLocal:
-		if w {
-			return qLocal
-		}
-		switch r {
-		case '+', '-', '.':
-			return qStart // после знака должна идти непустая группа \w+
-		case '@':
-			return qAfterAt
-		default:
-			return qDead
-		}
+			// Разделитель между адресами: \s*[;,.]{0,1}\s*
+			qSpaces:        {Word: qLocal, Space: qSpaces, Dot: qAfterSep, Sep: qAfterSep},
+			qAfterFinalDot: {Word: qEmailWord, Space: qAfterSep},
+			qAfterSep:      {Word: qLocal, Space: qAfterSep},
 
-	case qDead:
-		return qDead
-
-	case qAfterAt:
-		if w {
-			return qDomain
-		}
-		return qDead
-
-	case qDomain:
-		if w {
-			return qDomain
-		}
-		switch r {
-		case '-':
-			return qAfterAt
-		case '.':
-			return qAfterDot
-		default:
-			return qDead
-		}
-
-	case qAfterDot:
-		if w {
-			return qEmailEnd
-		}
-		return qDead
-
-	case qEmailEnd:
-		if w {
-			return qEmailWord
-		}
-		if s {
-			return qSpaces
-		}
-		switch r {
-		case '-':
-			return qAfterDot
-		case '.':
-			return qAfterFinalDot
-		case ';', ',':
-			return qAfterSep
-		default:
-			return qDead
-		}
-
-	case qEmailWord:
-		if w {
-			return qEmailWord
-		}
-		if s {
-			return qSpaces
-		}
-		switch r {
-		case '+':
-			return qStart
-		case '-':
-			return qAfterHyphen
-		case '.':
-			return qAfterFinalDot
-		case '@':
-			return qAfterAt
-		case ';', ',':
-			return qAfterSep
-		default:
-			return qDead
-		}
-
-	case qSpaces:
-		if w {
-			return qLocal
-		}
-		if s {
-			return qSpaces
-		}
-		if r == '.' || r == ';' || r == ',' {
-			return qAfterSep
-		}
-		return qDead
-
-	case qAfterFinalDot:
-		if w {
-			return qEmailWord
-		}
-		if s {
-			return qAfterSep
-		}
-		return qDead
-
-	case qAfterSep:
-		if w {
-			return qLocal
-		}
-		if s {
-			return qAfterSep
-		}
-		return qDead
-
-	case qAfterHyphen:
-		if w {
-			return qEmailWord
-		}
-		return qDead
-
-	default:
-		return qDead
+			// qDead переходов не имеет: из него автомат никуда не уходит.
+		},
 	}
+	a.Reset()
+	return a
 }
 
-// isFinal проверяет, является ли состояние заключительным (q6–q10).
-func isFinal(state int) bool {
-	switch state {
-	case qEmailEnd, qEmailWord, qSpaces, qAfterFinalDot, qAfterSep:
-		return true
-	default:
-		return false
+// Reset возвращает автомат в начальное состояние перед чтением новой цепочки.
+func (a *DFA) Reset() {
+	a.current = a.start
+}
+
+// State возвращает текущее состояние автомата.
+func (a *DFA) State() State {
+	return a.current
+}
+
+// Accepting сообщает, находится ли автомат в заключительном состоянии,
+// то есть принял бы он цепочку, если бы она закончилась прямо сейчас.
+func (a *DFA) Accepting() bool {
+	return a.final[a.current]
+}
+
+// Rejected сообщает, что автомат попал в q⊥ и цепочку уже не примет.
+func (a *DFA) Rejected() bool {
+	return a.current == a.dead
+}
+
+// Read выполняет один такт: читает символ r и переходит
+// в δ(текущее, класс(r)). Возвращает новое состояние.
+func (a *DFA) Read(r rune) State {
+	next, ok := a.delta[a.current][classify(r)]
+	if !ok {
+		next = a.dead
 	}
+	a.current = next
+	return next
 }
 
-// Run обрабатывает всю цепочку и возвращает последовательность
-// пройденных состояний (трассу) и результат распознавания.
-func Run(input string) ([]int, bool) {
-	state := qStart
-	trace := []int{state}
+// Run сбрасывает автомат, подаёт ему цепочку посимвольно и возвращает
+// последовательность пройденных состояний (трассу) и результат распознавания.
+func (a *DFA) Run(input string) ([]State, bool) {
+	a.Reset()
+	trace := []State{a.State()}
 	for _, r := range input {
-		state = nextState(state, r)
-		trace = append(trace, state)
-		if state == qDead {
+		trace = append(trace, a.Read(r))
+		if a.Rejected() {
 			break // из q⊥ выхода нет, дальше читать бессмысленно
 		}
 	}
-	return trace, isFinal(state)
+	return trace, a.Accepting()
 }
 
 // Accepts возвращает true, если цепочка принадлежит языку.
-func Accepts(input string) bool {
-	_, ok := Run(input)
+func (a *DFA) Accepts(input string) bool {
+	_, ok := a.Run(input)
 	return ok
 }
+
+// ─── Диалог с пользователем ───────────────────────────────────────────────────
 
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	// Увеличиваем стандартный лимит длины строки для длинных списков адресов.
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	dfa := NewEmailListDFA()
 
 	fmt.Println("Проверка строк конечным автоматом. Для выхода введите exit.")
 	for {
@@ -224,15 +213,8 @@ func main() {
 			break
 		}
 
-		trace, ok := Run(input)
-		fmt.Print("Трасса: ")
-		for i, q := range trace {
-			if i > 0 {
-				fmt.Print(" → ")
-			}
-			fmt.Print(stateNames[q])
-		}
-		fmt.Println()
+		trace, ok := dfa.Run(input)
+		fmt.Println("Трасса:", formatTrace(trace))
 		if ok {
 			fmt.Println("Цепочка принадлежит языку.")
 		} else {
@@ -244,4 +226,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Ошибка чтения ввода: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// formatTrace печатает трассу в виде «q0 → q1 → …».
+func formatTrace(trace []State) string {
+	names := make([]string, len(trace))
+	for i, q := range trace {
+		names[i] = q.String()
+	}
+	return strings.Join(names, " → ")
 }
